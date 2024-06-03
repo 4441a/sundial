@@ -1,0 +1,267 @@
+Let's start by translating the Python code into C, ensuring it handles HTTP requests, JSON parsing, time calculations, and file operations appropriately. We'll use `libcurl` for HTTP requests and `cJSON` for JSON parsing.
+
+### Prerequisites
+
+1. **Install `libcurl` and `cJSON`**:
+   - **macOS**: Use Homebrew to install `libcurl` and `cJSON`:
+     ```sh
+     brew install curl
+     brew install cjson
+     ```
+
+2. **Create the necessary directories and files**:
+   - Create a directory for the project.
+   - Inside the directory, create the C source file (e.g., `planetary_hours.c`).
+
+### C Code
+
+Here's the C code equivalent of your Python script:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <curl/curl.h>
+#include <cjson/cJSON.h>
+
+const char *days_to_planets[] = {"Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn"};
+const char *planetary_sequence[] = {"Saturn", "Jupiter", "Mars", "Sun", "Venus", "Mercury", "Moon"};
+
+const char *log_file_path = "script_run_log.txt";
+const char *api_log_file_path = "api_call_log.json";
+const char *run_info_log_file_path = "run_info_log.txt";
+
+struct MemoryStruct {
+    char *memory;
+    size_t size;
+};
+
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (ptr == NULL) {
+        // out of memory
+        printf("not enough memory (realloc returned NULL)\n");
+        return 0;
+    }
+
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
+}
+
+int get_sunrise_sunset(double lat, double lng, struct tm *sunrise, struct tm *sunset) {
+    CURL *curl_handle;
+    CURLcode res;
+    struct MemoryStruct chunk;
+
+    chunk.memory = malloc(1);  // will be grown as needed by the realloc above
+    chunk.size = 0;            // no data at this point
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://api.sunrise-sunset.org/json?lat=%f&lng=%f&formatted=0", lat, lng);
+
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    curl_handle = curl_easy_init();
+
+    curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+    res = curl_easy_perform(curl_handle);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        return 1;
+    } else {
+        cJSON *json = cJSON_Parse(chunk.memory);
+        cJSON *results = cJSON_GetObjectItemCaseSensitive(json, "results");
+
+        if (cJSON_IsObject(results)) {
+            cJSON *sunrise_str = cJSON_GetObjectItemCaseSensitive(results, "sunrise");
+            cJSON *sunset_str = cJSON_GetObjectItemCaseSensitive(results, "sunset");
+
+            if (cJSON_IsString(sunrise_str) && (sunrise_str->valuestring != NULL) && 
+                cJSON_IsString(sunset_str) && (sunset_str->valuestring != NULL)) {
+
+                strptime(sunrise_str->valuestring, "%Y-%m-%dT%H:%M:%S%z", sunrise);
+                strptime(sunset_str->valuestring, "%Y-%m-%dT%H:%M:%S%z", sunset);
+            }
+        }
+
+        cJSON_Delete(json);
+    }
+
+    curl_easy_cleanup(curl_handle);
+    free(chunk.memory);
+    curl_global_cleanup();
+
+    return 0;
+}
+
+void update_log(int *count) {
+    FILE *log_file = fopen(log_file_path, "r+");
+    if (log_file == NULL) {
+        log_file = fopen(log_file_path, "w");
+        *count = 0;
+    } else {
+        fscanf(log_file, "%d", count);
+    }
+    (*count)++;
+    freopen(log_file_path, "w", log_file);
+    fprintf(log_file, "%d", *count);
+    fclose(log_file);
+}
+
+void log_api_call(const char *date_str) {
+    FILE *api_log_file = fopen(api_log_file_path, "w");
+    fprintf(api_log_file, "{\"last_api_call\": \"%s\"}", date_str);
+    fclose(api_log_file);
+}
+
+time_t get_last_api_call() {
+    FILE *api_log_file = fopen(api_log_file_path, "r");
+    if (api_log_file == NULL) {
+        return 0;
+    }
+
+    char buffer[256];
+    fscanf(api_log_file, "%255s", buffer);
+    fclose(api_log_file);
+
+    cJSON *json = cJSON_Parse(buffer);
+    cJSON *last_api_call = cJSON_GetObjectItemCaseSensitive(json, "last_api_call");
+
+    struct tm tm;
+    time_t last_api_call_time = 0;
+
+    if (cJSON_IsString(last_api_call) && (last_api_call->valuestring != NULL)) {
+        strptime(last_api_call->valuestring, "%Y-%m-%dT%H:%M:%S%z", &tm);
+        last_api_call_time = mktime(&tm);
+    }
+
+    cJSON_Delete(json);
+    return last_api_call_time;
+}
+
+void log_run_info(struct tm *current_time, const char *planet, struct tm *start_time, struct tm *end_time) {
+    FILE *run_info_log_file = fopen(run_info_log_file_path, "a");
+    fprintf(run_info_log_file, "%s - Governing Planet: %s, Start: %s, End: %s\n",
+            asctime(current_time), planet, asctime(start_time), asctime(end_time));
+    fclose(run_info_log_file);
+}
+
+void calculate_minutes_info(struct tm *current_time, struct tm *start_time, struct tm *end_time,
+                            int *minutes_into_planet, int *minutes_left_planet) {
+    time_t current = mktime(current_time);
+    time_t start = mktime(start_time);
+    time_t end = mktime(end_time);
+
+    *minutes_into_planet = (int)difftime(current, start) / 60;
+    *minutes_left_planet = (int)difftime(end, current) / 60;
+}
+
+int main() {
+    double lat = 36.7201600;
+    double lng = -4.4203400;
+
+    time_t rawtime;
+    struct tm *current_time;
+    time(&rawtime);
+    current_time = gmtime(&rawtime);
+
+    struct tm sunrise, sunset;
+    memset(&sunrise, 0, sizeof(struct tm));
+    memset(&sunset, 0, sizeof(struct tm));
+
+    time_t last_api_call_time = get_last_api_call();
+    time_t one_hour_before_sunrise;
+    if (last_api_call_time != 0) {
+        sunrise.tm_hour -= 1;
+        one_hour_before_sunrise = mktime(&sunrise);
+    }
+
+    if (last_api_call_time == 0 || difftime(rawtime, one_hour_before_sunrise) >= 0) {
+        if (get_sunrise_sunset(lat, lng, &sunrise, &sunset) == 0) {
+            char date_str[256];
+            strftime(date_str, sizeof(date_str), "%Y-%m-%dT%H:%M:%S%z", current_time);
+            log_api_call(date_str);
+        }
+    }
+
+    int run_count;
+    update_log(&run_count);
+
+    // Calculate planetary hour and its start and end times
+    double daylight_duration = difftime(mktime(&sunset), mktime(&sunrise)) / 12.0;
+    int hours_since_sunrise = (int)(difftime(rawtime, mktime(&sunrise)) / daylight_duration);
+    int day_of_week = current_time->tm_wday;
+    const char *first_hour_planet = days_to_planets[day_of_week];
+
+    int start_index = 0;
+    for (int i = 0; i < 7; i++) {
+        if (strcmp(planetary_sequence[i], first_hour_planet) == 0) {
+            start_index = i;
+            break;
+        }
+    }
+
+    int current_hour_index = (start_index + hours_since_sunrise) % 7;
+    const char *current_hour_planet = planetary_sequence[current_hour_index];
+
+    struct tm current_hour_start = sunrise;
+    current_hour_start.tm_sec += hours_since_sunrise * (int)daylight_duration;
+    struct tm current_hour_end = current_hour_start;
+    current_hour_end.tm_sec += (int)daylight_duration;
+
+    log_run_info(current_time, current_hour_planet, &current_hour_start, &current_hour_end);
+
+    int minutes_into_planet, minutes_left_planet;
+    calculate_minutes_info(current_time, &current_hour_start, &current_hour_end,
+                           &minutes
+
+_into_planet, &minutes_left_planet);
+
+    printf("The governing planet for the current hour is: %s\n", current_hour_planet);
+    printf("This script has been run %d times.\n", run_count);
+    printf("Minutes into the %s hour: %d\n", current_hour_planet, minutes_into_planet);
+    printf("Minutes left until the next planetary hour: %d\n", minutes_left_planet);
+
+    return 0;
+}
+```
+
+### Compilation Instructions
+
+1. **Navigate to your project directory**:
+   ```sh
+   cd /path/to/your/project
+   ```
+
+2. **Compile the C program with `gcc`**:
+   ```sh
+   gcc -o planetary_hours planetary_hours.c -lcurl -lcjson
+   ```
+
+3. **Run the compiled program**:
+   ```sh
+   ./planetary_hours
+   ```
+
+### Explanation
+
+- **Dependencies**: The program relies on `libcurl` for making HTTP requests and `cJSON` for parsing JSON data.
+- **Functionality**: The C code mirrors the functionality of the original Python script:
+  - Retrieves sunrise and sunset times from the API.
+  - Logs script runs and API calls.
+  - Calculates and logs the governing planet for the current planetary hour.
+  - Provides information on the minutes lapsed and remaining in the current planetary hour.
+
+Feel free to ask if you have any questions or need further assistance!
